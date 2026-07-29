@@ -65,11 +65,23 @@ Ask for their answers or their score breakdown, then for each miss determine
 This distinction drives completely different remedies, and lumping them
 together as "got it wrong" is the most common way exam prep wastes time.
 
-Log the result:
+Log the result — **one event per topic**, in question counts, with
+`kind: "practice"`:
 
 ```bash
-node lib/log-event.js '{"type":"exam","class":"15-122","exam":"exams/practice-midterm.pdf","score":34,"max":50,"topics":["loop-invariants","big-o-analysis"],"missed":["forgets metric must be bounded below","misapplies master theorem case 2"]}'
+node lib/log-event.js '[
+  {"type":"exam","class":"15-122","exam":"exams/practice-midterm.pdf","kind":"practice","topic":"loop-invariants","asked":6,"correct":3.5,"missed":["forgets metric must be bounded below"]},
+  {"type":"exam","class":"15-122","exam":"exams/practice-midterm.pdf","kind":"practice","topic":"big-o-analysis","asked":4,"correct":2,"missed":["misapplies master theorem case 2"]}
+]'
 ```
+
+See the exam-event rules in the skill: singular `topic`, question counts rather
+than points, and `kind: "practice"` so this stays out of the real-exam
+calibration series. A single event carrying a `topics[]` array reaches nothing —
+the result would be silently discarded.
+
+If you genuinely can't attribute questions to topics, log nothing and say so
+rather than guessing at a split.
 
 Then write `vault/classes/<id>/exams/<name>-postmortem.md` with the coverage
 table, the per-miss causes, and a prioritized fix list. Append anything that

@@ -59,6 +59,21 @@ thing you notice.
    quiz accuracy; time of day; whether topics studied right before a quiz score
    better than ones studied days earlier.
 
+6. **Calibration** — run `./bin/studyos calibrate` and read it. This answers the
+   question underneath every other number you report: does `mastery` actually
+   predict exam performance?
+
+   If the real-exam series shows systematic overconfidence, say so plainly and
+   carry the caveat into the rest of your analysis — a "mastery 4" topic in an
+   overconfident class is not a topic to stop reviewing.
+
+   The small-n gates are enforced in `lib/calibration.js`, so respect what it
+   gives you: when it declines to state a bias, **do not compute one yourself
+   from the rows**. Report the rows and say it's too early. The "examined but
+   never tested beforehand" list is worth surfacing regardless of n — that's a
+   coverage failure, not a calibration finding, and it means the system let the
+   user walk into an exam blind on that material.
+
 ## The honesty rule
 
 You will usually have between ten and a few hundred events. That is enough to

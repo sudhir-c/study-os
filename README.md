@@ -26,6 +26,8 @@ studyos quiz 15-122 --topic loop-invariants -n 8
 studyos prep 15-122 --exam ~/practice-midterm.pdf
 studyos plan today             # "3 hrs tonight, midterm Friday"
 studyos log "2hr on graphs, stuck on the Dijkstra proof"
+studyos grade 15-122           # record a real exam result
+studyos calibrate              # did mastery predict your scores?
 studyos review                 # analyst pass over your history
 studyos status
 studyos                        # interactive session over the whole vault
@@ -71,12 +73,13 @@ lib/vault.js            frontmatter + path conventions
 lib/events.js           append-only event log
 lib/mastery.js          mastery derivation + spaced-repetition scheduling
 lib/dashboard.js        shared snapshot behind `status` and the status line
+lib/calibration.js      predicted mastery vs actual exam performance
 lib/terminal.js         Terminal.app profile switching
 lib/automation.js       launchd plist generation
 lib/adapters/           apple-notes.js, folder.js
 .claude/skills/         study-os conventions (the shared contract)
 .claude/agents/         transcriber, quizmaster, planner, analyst
-.claude/commands/       /ingest /class /quiz /prep /plan /log /review
+.claude/commands/       /ingest /class /quiz /prep /grade /plan /log /review
 inbox/                  drop zone (contents gitignored)
 vault/                  your notes and study log — gitignored, never pushed
 ```
@@ -158,6 +161,43 @@ independent caps keep it honest:
 Recent attempts are weighted more heavily than old ones, and scoring under half
 resets the review interval to tomorrow regardless of accumulated mastery.
 
+## Calibration — does mastery actually predict anything?
+
+Every other number leans on the mastery estimator, so it gets checked against
+ground truth. Record a real exam with `studyos grade <class>`, then:
+
+```
+studyos calibrate
+
+15-122 · calibration
+
+  Real exams  (1 exam, 6 topic results)
+
+    predicted    actual    n
+    4 (~80%)        54%    3   overconfident by 26pts
+    3 (~60%)        31%    2   (too few to read)
+
+    Overall bias: -29pts (overconfident)
+
+    Examined but never tested beforehand:
+      recursion                scored 25%
+```
+
+Three properties worth knowing:
+
+- **The prediction is time-bounded.** Predicted mastery is recomputed as it
+  stood *strictly before* each exam. Including the exam would make the estimator
+  look perfectly calibrated by construction.
+- **Expected accuracy is not invented.** Mastery is `round(accuracy × 5)`, so
+  the expected value is just `mastery / 5`. Nothing to argue with.
+- **Small-n honesty is enforced in `lib/calibration.js`, not in the renderer.**
+  No headline bias below 5 topic results, no per-level verdict below 3, and real
+  and practice exams are never pooled — a self-graded practice test is not
+  evidence about a real exam.
+
+It is **report-only**. Mastery stays a pure function of the event log; a handful
+of exam results is nowhere near enough to start bending the estimator.
+
 ## Status
 
 Phases 1–4 are built and verified end-to-end: vault, CLI, ingestion, quizzing,
@@ -168,5 +208,5 @@ Not yet exercised against real data: the interactive quiz loop and the live
 Apple Notes sync (which needs a one-time macOS Automation permission grant).
 
 ```bash
-npm test    # 80 tests
+npm test    # 97 tests
 ```

@@ -26,6 +26,7 @@ import { rebuildClass, dueTopics } from '../lib/mastery.js';
 import { examsSoon, inboxItems, listTopics, accuracySince, snapshot } from '../lib/dashboard.js';
 import * as automation from '../lib/automation.js';
 import * as terminal from '../lib/terminal.js';
+import * as calibration from '../lib/calibration.js';
 
 const ROOT = projectRoot();
 const P = paths(ROOT);
@@ -82,7 +83,9 @@ const COMMANDS = {
   plan: { mode: 'interactive', slash: 'plan', help: '[today|week]      Build a study plan' },
   log: { mode: 'print', slash: 'log', help: '"<what you did>"  Record a study session' },
   review: { mode: 'print', slash: 'review', help: '[--class X]       Analyst pass over your history' },
+  grade: { mode: 'interactive', slash: 'grade', help: '<class> [--exam N] Record a real exam result' },
   status: { mode: 'local', help: '[class]           Dashboard: mastery, due, upcoming' },
+  calibrate: { mode: 'local', help: '[class]           Did mastery predict your exam scores?' },
   rebuild: { mode: 'local', help: '[class]           Rebuild derived caches from events.jsonl' },
   automation: { mode: 'local', help: '<enable|disable|status>  Background watcher + nightly review' },
   theme: { mode: 'local', help: '<install|list|status|restore>  Terminal appearance' },
@@ -134,6 +137,9 @@ switch (name) {
     break;
   case 'rebuild':
     exitWith(await cmdRebuild(rest));
+    break;
+  case 'calibrate':
+    exitWith(await cmdCalibrate(rest));
     break;
   case 'pull':
     exitWith(await cmdPull(rest));
@@ -408,6 +414,118 @@ async function cmdStatus(args) {
   const pending = inboxItems(ROOT);
   if (pending.length) {
     console.log(`\n\x1b[36m${pending.length} item(s) waiting in inbox/\x1b[0m — run: studyos ingest`);
+  }
+  console.log('');
+  return 0;
+}
+
+/**
+ * Render one calibration series.
+ *
+ * The small-n gates live in lib/calibration.js rather than here, so the honesty
+ * rules hold for every consumer (the analyst reads the same numbers) instead of
+ * being a property of this renderer.
+ */
+function renderSeries(s, label) {
+  const pct = (v) => `${Math.round(v)}%`;
+  const pts = (v) => `${v > 0 ? '+' : ''}${Math.round(v)}pts`;
+
+  if (s.n === 0 && s.untestedGoingIn.length === 0) return false;
+
+  const examCount = s.exams.length;
+  console.log(
+    `\n  \x1b[1m${label}\x1b[0m  \x1b[2m(${examCount} exam${examCount === 1 ? '' : 's'}, ` +
+      `${s.n} topic result${s.n === 1 ? '' : 's'})\x1b[0m`,
+  );
+
+  if (s.byLevel.length) {
+    console.log(`\n    \x1b[2mpredicted    actual    n\x1b[0m`);
+    for (const l of s.byLevel) {
+      const verdict = !l.reliable
+        ? '\x1b[2m(too few to read)\x1b[0m'
+        : Math.abs(l.error) <= calibration.WELL_CALIBRATED_BAND
+          ? '\x1b[32mwell calibrated\x1b[0m'
+          : l.error < 0
+            ? `\x1b[31moverconfident by ${Math.abs(Math.round(l.error))}pts\x1b[0m`
+            : `\x1b[33munderconfident by ${Math.round(l.error)}pts\x1b[0m`;
+      console.log(
+        `    ${String(l.predicted)} (~${pct(l.expected)})`.padEnd(17) +
+          `${pct(l.actual)}`.padStart(6) +
+          `${l.n}`.padStart(5) +
+          `   ${verdict}`,
+      );
+    }
+  }
+
+  if (s.n > 0) {
+    if (s.sufficient) {
+      const verdict = calibration.describeBias(s.bias);
+      const tint = verdict === 'well calibrated' ? '\x1b[32m' : '\x1b[31m';
+      console.log(`\n    Overall bias: ${tint}${pts(s.bias)} (${verdict})\x1b[0m`);
+    } else {
+      // Deliberately no headline figure: a bias computed from a handful of
+      // topics is noise wearing a number's clothes.
+      console.log(
+        `\n    \x1b[2mn=${s.n} — too few results to call a bias yet ` +
+          `(need ${calibration.MIN_N_FOR_BIAS}). Rows above are raw.\x1b[0m`,
+      );
+    }
+  }
+
+  if (s.untestedGoingIn.length) {
+    console.log(
+      `\n    \x1b[33mExamined but never tested beforehand:\x1b[0m ` +
+        `\x1b[2m(no prediction to check — a coverage gap, not a calibration miss)\x1b[0m`,
+    );
+    for (const u of s.untestedGoingIn) {
+      console.log(`      ${u.topic.padEnd(24)} scored ${pct(u.actual)}`);
+    }
+  }
+  return true;
+}
+
+async function cmdCalibrate(args) {
+  const flags = parseFlags(args);
+  const positional = args.filter((a) => !a.startsWith('--'));
+  const only = positional[0] ? mustResolve(positional[0]) : null;
+  if (positional[0] && !only) return 1;
+
+  let want = calibration.SERIES;
+  if (flags.real && !flags.practice) want = ['real'];
+  if (flags.practice && !flags.real) want = ['practice'];
+
+  const ids = only ? [only] : listClasses(ROOT);
+  if (ids.length === 0) {
+    console.log('No classes yet.');
+    return 0;
+  }
+
+  let printedAnything = false;
+  for (const id of ids) {
+    const series = await calibration.calibrate(id, ROOT);
+    const shown = want.filter((k) => series[k].n > 0 || series[k].untestedGoingIn.length > 0);
+    if (shown.length === 0) continue;
+
+    printedAnything = true;
+    console.log(`\n\x1b[1m\x1b[36m${id}\x1b[0m \x1b[2m· calibration\x1b[0m`);
+    for (const k of shown) {
+      renderSeries(series[k], k === 'real' ? 'Real exams' : 'Practice tests');
+    }
+    if (shown.includes('real') && shown.includes('practice')) {
+      console.log(
+        `\n    \x1b[2mSeries are never pooled — a self-graded practice test is not\x1b[0m\n` +
+          `    \x1b[2mevidence about a real exam.\x1b[0m`,
+      );
+    }
+  }
+
+  if (!printedAnything) {
+    console.log(
+      '\nNo exam results recorded yet.\n' +
+        '  Real exam:     studyos grade <class>\n' +
+        '  Practice test: studyos prep <class> --exam <file> --mode postmortem\n',
+    );
+    return 0;
   }
   console.log('');
   return 0;

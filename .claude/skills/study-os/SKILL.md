@@ -119,12 +119,39 @@ Types and their conventional fields (`ts` is added automatically):
 | `ingest` | `class`, `source` (original filename), `note` (written path), `topics[]`, `pages`, `confidence` |
 | `quiz` | `class`, `topic`, `asked`, `correct`, `missed[]` |
 | `session` | `class`, `topic`, `minutes`, `what`, `stuck[]` |
-| `exam` | `class`, `exam`, `score`, `max`, `missed[]`, `topics[]` |
+| `exam` | `class`, `exam`, `kind`, `topic`, `asked`, `correct`, `missed[]`, optional `points_earned`/`points_possible` |
 | `plan` | `class`, `horizon`, `items[]` |
 | `reflect` | `class`, `note` |
 
 **`missed[]` carries concepts, not question numbers.** `"termination metric"` is
 useful to the analyst and the planner; `"Q3b"` is not.
+
+### Exam events: one per topic, in question counts
+
+An `exam` event is shaped **exactly like a quiz event** — singular `topic` plus
+`asked`/`correct` — with exam metadata alongside. Emit one event per topic, all
+sharing the same `exam` and `ts` so they group into one sitting:
+
+```bash
+node lib/log-event.js '[
+  {"type":"exam","class":"15-122","exam":"exams/midterm-1","kind":"real","ts":"2026-10-02T00:00:00Z","topic":"loop-invariants","asked":6,"correct":3.5,"points_earned":7,"points_possible":12,"missed":["..."]},
+  {"type":"exam","class":"15-122","exam":"exams/midterm-1","kind":"real","ts":"2026-10-02T00:00:00Z","topic":"big-o-analysis","asked":4,"correct":4,"missed":[]}
+]'
+```
+
+Three rules, each of which was a real bug before it was written down:
+
+- **`topic` is singular and required.** Mastery only counts events carrying a
+  `topic`; an event with a `topics[]` array reaches nothing and the exam result
+  is silently discarded.
+- **`asked`/`correct` are question counts, never points.** Mastery treats
+  `asked` as a confidence signal, so a 50-point exam logged as `asked: 50` would
+  push a topic to the top confidence tier off one sitting. Points belong in
+  `points_earned`/`points_possible`, which never feed mastery. `correct` may be
+  fractional for partial credit.
+- **`kind` is `"real"` or `"practice"`.** Calibration reports the two as
+  separate series and never pools them — a self-graded practice test is not
+  evidence about a real exam. An event with no `kind` is treated as practice.
 
 **Paths in events are class-relative** — the event already carries `class`, so
 write `"note":"notes/2026-09-09-loop-invariants.md"`, never

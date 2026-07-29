@@ -102,6 +102,13 @@ ordinary Claude Code, because developing the tool and using it want opposite UI.
   profile on exit. Apple Terminal only; silently skipped elsewhere. If a session
   is `kill -9`'d the restore is skipped, so `studyos theme restore` recovers it.
 
+  The colours are **randomised per launch** from eight curated dark palettes —
+  indigo, forest, plum, teal, oxblood, navy, espresso, slate. `studyos theme list`
+  shows swatches. The same palette never comes up twice in a row, and every one
+  clears WCAG AAA contrast (text 13.8–14.3:1, accent 7.4–11.4:1), enforced by a
+  test. Pin one with `STUDYOS_THEME=teal studyos`. Only the StudyOS profile is
+  ever restyled — your stock profiles are left alone.
+
 - **Banner and session name** — an ASCII wordmark with live study state, and the
   session is named `StudyOS`, which also retitles the terminal window. Launching
   clears the viewport first (scrollback is preserved) so the wordmark opens a
@@ -161,5 +168,5 @@ Not yet exercised against real data: the interactive quiz loop and the live
 Apple Notes sync (which needs a one-time macOS Automation permission grant).
 
 ```bash
-npm test    # 71 tests
+npm test    # 80 tests
 ```

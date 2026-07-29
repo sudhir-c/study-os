@@ -85,7 +85,7 @@ const COMMANDS = {
   status: { mode: 'local', help: '[class]           Dashboard: mastery, due, upcoming' },
   rebuild: { mode: 'local', help: '[class]           Rebuild derived caches from events.jsonl' },
   automation: { mode: 'local', help: '<enable|disable|status>  Background watcher + nightly review' },
-  theme: { mode: 'local', help: '<install|restore|status>  StudyOS terminal appearance' },
+  theme: { mode: 'local', help: '<install|list|status|restore>  Terminal appearance' },
   doctor: { mode: 'local', help: '                  Check the install' },
   help: { mode: 'local', help: '                  Show this' },
 };
@@ -576,6 +576,12 @@ function cmdAutomation(args) {
   return 1;
 }
 
+/** "#RRGGBB" -> "r;g;b" for truecolor SGR escapes. */
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return `${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}`;
+}
+
 function cmdTheme(args) {
   const sub = args[0] ?? 'status';
 
@@ -590,6 +596,12 @@ function cmdTheme(args) {
     }
     console.log(`  profile installed : ${s.installed ? 'yes' : 'no  (studyos theme install)'}`);
     console.log(`  current profile   : ${s.current ?? 'unknown'}`);
+    console.log(
+      `  colours           : ${
+        s.pinned ? `${s.pinned} (pinned via STUDYOS_THEME)` : 'random each launch'
+      }`,
+    );
+    if (s.lastPalette && !s.pinned) console.log(`  last used         : ${s.lastPalette}`);
     if (s.pendingRestore) {
       console.log(
         `\n  \x1b[33mA session left the theme applied.\x1b[0m` +
@@ -622,6 +634,23 @@ function cmdTheme(args) {
     return 0;
   }
 
+  if (sub === 'list') {
+    console.log('  Dark palettes, one picked at random per launch:\n');
+    for (const name of terminal.PALETTE_NAMES) {
+      const p = terminal.PALETTES[name];
+      // Swatch: accent text on the palette's own background, drawn with
+      // truecolor escapes so you see the real pairing rather than a name.
+      const bg = hexToRgb(p.background);
+      const fg = hexToRgb(p.text);
+      const ac = hexToRgb(p.accent);
+      const swatch =
+        `\x1b[48;2;${bg}m\x1b[38;2;${fg}m  Aa  \x1b[38;2;${ac}m▍▍\x1b[0m`;
+      console.log(`  ${swatch}  ${name.padEnd(9)} ${p.background}`);
+    }
+    console.log('\n  Pin one with:  STUDYOS_THEME=teal studyos');
+    return 0;
+  }
+
   if (sub === 'restore') {
     const ok = terminal.deactivate(null, ROOT);
     console.log(ok ? '  ✓ Restored your previous Terminal profile.' : '  Nothing to restore.');
@@ -636,7 +665,7 @@ function cmdTheme(args) {
   }
 
   console.error(
-    `studyos theme: unknown subcommand "${sub}" (expected install, restore, status, uninstall)`,
+    `studyos theme: unknown subcommand "${sub}" (expected install, list, restore, status, uninstall)`,
   );
   return 1;
 }

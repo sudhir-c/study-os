@@ -1,0 +1,119 @@
+#!/usr/bin/env node
+/**
+ * statusline — the StudyOS status bar.
+ *
+ * Claude Code pipes session JSON on stdin (model, context window, cost). We
+ * mostly ignore it: the point of this bar is *study* state, not session state.
+ * You already know you're talking to a model; what you can't see is which
+ * topic is weakest and how long until the midterm.
+ *
+ *   15-122 · loop-invariants ███░░ 3/5      ▲ Midterm in 4d
+ *   2 due · 2 never tested · inbox: 3 waiting · 73% acc
+ *
+ * Contract notes:
+ *  - Runs on every debounced (300ms) session event, so it must stay fast.
+ *    snapshot() measures ~68ms cold including node startup, well inside budget,
+ *    which is why there is no cache layer and therefore no staleness bug.
+ *  - Must never throw. A stack trace rendered into the status bar is both
+ *    useless and hard to dismiss; snapshot() already degrades to an empty
+ *    shape, and the top-level catch here is the second line of defence.
+ *  - STUDYOS_STATUSLINE=compact collapses to one line. The docs flag
+ *    multi-line + ANSI as the most redraw-glitch-prone combination, so this is
+ *    the escape hatch if it ever renders badly in your terminal.
+ */
+
+import { snapshot } from '../lib/dashboard.js';
+import { projectRoot } from '../lib/vault.js';
+
+// Honour NO_COLOR so the bar stays readable in a plain pipe or a CI log.
+const COLOR = !process.env.NO_COLOR;
+const c = (code, s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+
+const bold = (s) => c('1', s);
+const dim = (s) => c('2', s);
+const cyan = (s) => c('36', s);
+const green = (s) => c('32', s);
+const yellow = (s) => c('33', s);
+const red = (s) => c('31', s);
+const magenta = (s) => c('35', s);
+
+const SEP = dim(' · ');
+
+/** Mastery 0–5 as a five-cell bar. Unknown mastery reads as unknown, not zero. */
+function masteryBar(mastery) {
+  if (mastery === null || mastery === undefined) return dim('·····') + ' ' + dim('?');
+  const filled = Math.max(0, Math.min(5, mastery));
+  const tint = filled <= 2 ? red : filled <= 3 ? yellow : green;
+  return tint('█'.repeat(filled)) + dim('░'.repeat(5 - filled)) + ' ' + tint(`${filled}/5`);
+}
+
+/** Exam countdown, coloured by urgency. */
+function examSegment(exam) {
+  if (!exam) return '';
+  const label = `▲ ${exam.name} in ${exam.days}d`;
+  if (exam.days <= 3) return bold(red(label));
+  if (exam.days <= 7) return yellow(label);
+  return magenta(label);
+}
+
+function render(s) {
+  if (s.empty || !s.classId) {
+    const hint = s.inbox > 0 ? `${s.inbox} in inbox — run: studyos ingest` : 'no classes yet — studyos class add';
+    return [dim('StudyOS') + SEP + dim(hint)];
+  }
+
+  // --- line 1: what to work on, and what's coming ---
+  const topic = s.weakest ? String(s.weakest.topic ?? s.weakest.slug ?? '') : '';
+  const left = [
+    bold(cyan(s.classId)),
+    topic ? `${topic} ${masteryBar(s.weakest.mastery)}` : dim('no topics yet'),
+  ].join(SEP);
+
+  const exam = examSegment(s.exam);
+  const line1 = exam ? `${left}   ${exam}` : left;
+
+  // --- line 2: workload ---
+  const parts = [];
+  if (s.due > 0) parts.push(yellow(`${s.due} due`));
+  if (s.untested > 0) parts.push(cyan(`${s.untested} never tested`));
+  if (s.due === 0 && s.untested === 0) parts.push(green('all caught up'));
+  if (s.inbox > 0) parts.push(bold(`inbox: ${s.inbox} waiting`));
+  if (s.accuracy.ratio !== null) {
+    const pct = Math.round(s.accuracy.ratio * 100);
+    const tint = pct >= 80 ? green : pct >= 60 ? yellow : red;
+    parts.push(tint(`${pct}% acc`));
+  }
+  const line2 = parts.join(SEP);
+
+  return [line1, line2];
+}
+
+/** One-line variant: the highest-signal fields only. */
+function renderCompact(s) {
+  if (s.empty || !s.classId) return [dim('StudyOS · no classes yet')];
+  const parts = [bold(cyan(s.classId))];
+  if (s.weakest) parts.push(`${s.weakest.topic ?? s.weakest.slug} ${masteryBar(s.weakest.mastery)}`);
+  if (s.due > 0) parts.push(yellow(`${s.due} due`));
+  if (s.untested > 0) parts.push(cyan(`${s.untested} new`));
+  if (s.inbox > 0) parts.push(bold(`inbox ${s.inbox}`));
+  const line = parts.join(SEP);
+  const exam = examSegment(s.exam);
+  return [exam ? `${line}   ${exam}` : line];
+}
+
+try {
+  // Drain stdin so Claude Code's write never blocks, even though the session
+  // payload isn't used. Not awaiting it would risk an EPIPE on their side.
+  if (!process.stdin.isTTY) {
+    process.stdin.resume();
+    process.stdin.on('data', () => {});
+    process.stdin.on('error', () => {});
+  }
+
+  const s = await snapshot(projectRoot());
+  const lines = process.env.STUDYOS_STATUSLINE === 'compact' ? renderCompact(s) : render(s);
+  process.stdout.write(lines.join('\n') + '\n');
+} catch {
+  // Last resort: emit a valid, quiet bar rather than nothing or a trace.
+  process.stdout.write(dim('StudyOS') + '\n');
+}

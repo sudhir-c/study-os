@@ -21,11 +21,11 @@ import {
   classPaths,
   createClass,
   readDoc,
-  slugify,
 } from '../lib/vault.js';
-import { query } from '../lib/events.js';
 import { rebuildClass, dueTopics } from '../lib/mastery.js';
+import { examsSoon, inboxItems, listTopics, accuracySince, snapshot } from '../lib/dashboard.js';
 import * as automation from '../lib/automation.js';
+import * as terminal from '../lib/terminal.js';
 
 const ROOT = projectRoot();
 const P = paths(ROOT);
@@ -44,6 +44,26 @@ const P = paths(ROOT);
  * whole event log alongside a semester of notes. Override with STUDYOS_MODEL.
  */
 const MODEL = process.env.STUDYOS_MODEL || 'opus[1m]';
+
+/**
+ * StudyOS chrome, loaded only here.
+ *
+ * Deliberately NOT in .claude/settings.json: this repo is used both for
+ * studying and for developing studyos, and those want opposite UI. Passing it
+ * via --settings means `studyos` looks like StudyOS while a plain `claude` in
+ * the same directory stays ordinary Claude Code. --settings merges over
+ * project settings, so permissions and the pinned model still apply.
+ *
+ * Declared up here, not beside runClaude: the dispatch switch below runs at
+ * module top level, so a `const` defined further down is still in the temporal
+ * dead zone when an interactive command reaches for it.
+ */
+const CHROME_SETTINGS = path.join(ROOT, '.claude', 'studyos.settings.json');
+
+const BANNER = `
+  \x1b[38;5;180m┌─┐┌┬┐┬ ┬┌┬┐┬ ┬  ┌─┐┌─┐\x1b[0m
+  \x1b[38;5;180m└─┐ │ │ ││ │└┬┘  │ │└─┐\x1b[0m
+  \x1b[38;5;180m└─┘ ┴ └─┘─┴┘ ┴   └─┘└─┘\x1b[0m`;
 
 // ---------------------------------------------------------------------------
 // Command table
@@ -65,6 +85,7 @@ const COMMANDS = {
   status: { mode: 'local', help: '[class]           Dashboard: mastery, due, upcoming' },
   rebuild: { mode: 'local', help: '[class]           Rebuild derived caches from events.jsonl' },
   automation: { mode: 'local', help: '<enable|disable|status>  Background watcher + nightly review' },
+  theme: { mode: 'local', help: '<install|restore|status>  StudyOS terminal appearance' },
   doctor: { mode: 'local', help: '                  Check the install' },
   help: { mode: 'local', help: '                  Show this' },
 };
@@ -78,7 +99,7 @@ const argv = process.argv.slice(2);
 // Bare `studyos` opens an interactive session over the vault.
 if (argv.length === 0) {
   ensureVault(ROOT);
-  exitWith(runClaude([], { interactive: true }));
+  exitWith(await runClaude([], { interactive: true }));
 }
 
 const name = argv[0];
@@ -106,7 +127,7 @@ ensureVault(ROOT);
 
 switch (name) {
   case 'class':
-    exitWith(cmdClass(rest));
+    exitWith(await cmdClass(rest));
     break;
   case 'status':
     exitWith(await cmdStatus(rest));
@@ -120,11 +141,14 @@ switch (name) {
   case 'automation':
     exitWith(cmdAutomation(rest));
     break;
+  case 'theme':
+    exitWith(cmdTheme(rest));
+    break;
   case 'doctor':
     exitWith(cmdDoctor());
     break;
   default:
-    exitWith(forward(cmd, rest));
+    exitWith(await forward(cmd, rest));
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +156,7 @@ switch (name) {
 // ---------------------------------------------------------------------------
 
 /** Build a `/slash arg arg` invocation and hand it to Claude. */
-function forward(cmd, args) {
+async function forward(cmd, args) {
   const slashFile = path.join(ROOT, '.claude', 'commands', `${cmd.slash}.md`);
   if (!fs.existsSync(slashFile)) {
     console.error(
@@ -159,9 +183,32 @@ function quoteArg(a) {
   return /[\s"']/.test(a) ? JSON.stringify(a) : a;
 }
 
-function runClaude(promptArgs, { interactive }) {
+/** One dim line of live study state under the wordmark. */
+async function bannerStatus() {
+  try {
+    const s = await snapshot(ROOT);
+    if (s.empty || !s.classId) return 'no classes yet — studyos class add <id>';
+    const bits = [s.classId];
+    if (s.due > 0) bits.push(`${s.due} due`);
+    if (s.untested > 0) bits.push(`${s.untested} never tested`);
+    if (s.inbox > 0) bits.push(`inbox: ${s.inbox}`);
+    if (s.exam) bits.push(`▲ ${s.exam.name} in ${s.exam.days}d`);
+    return bits.join(' · ');
+  } catch {
+    return '';
+  }
+}
+
+async function runClaude(promptArgs, { interactive }) {
   const args = ['--model', MODEL];
-  if (!interactive) {
+
+  // Chrome and terminal styling are interactive-only. Print mode feeds the
+  // watcher and the nightly job, which parse stdout — a banner or an ANSI
+  // status line there would corrupt output they depend on.
+  if (interactive) {
+    args.push('--name', 'StudyOS');
+    if (fs.existsSync(CHROME_SETTINGS)) args.push('--settings', CHROME_SETTINGS);
+  } else {
     args.push('--print');
     // The vault is the user's own data and every write is confined to it;
     // prompting for each file edit would make the watcher unusable.
@@ -169,23 +216,54 @@ function runClaude(promptArgs, { interactive }) {
   }
   args.push(...promptArgs);
 
-  const res = spawnSync('claude', args, { cwd: ROOT, stdio: 'inherit' });
-  if (res.error) {
-    if (res.error.code === 'ENOENT') {
-      console.error('studyos: `claude` not found on PATH. Install Claude Code first.');
-      return 127;
+  let theme = { active: false, previous: null };
+  const restore = () => {
+    if (theme.active) {
+      terminal.deactivate(theme.previous, ROOT);
+      theme.active = false;
     }
-    console.error(`studyos: ${res.error.message}`);
-    return 1;
+  };
+
+  if (interactive) {
+    console.log(BANNER);
+    const status = await bannerStatus();
+    if (status) console.log(`  \x1b[2m${status}\x1b[0m\n`);
+    theme = terminal.activate(ROOT);
   }
-  return res.status ?? 0;
+
+  // Restore on the way out however we leave — normal exit, Ctrl-C, or SIGTERM.
+  // A SIGKILL still can't be caught, which is why `studyos theme restore`
+  // exists and why activate() persists the previous profile to disk.
+  const onSignal = () => {
+    restore();
+    process.exit(130);
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  try {
+    const res = spawnSync('claude', args, { cwd: ROOT, stdio: 'inherit' });
+    if (res.error) {
+      if (res.error.code === 'ENOENT') {
+        console.error('studyos: `claude` not found on PATH. Install Claude Code first.');
+        return 127;
+      }
+      console.error(`studyos: ${res.error.message}`);
+      return 1;
+    }
+    return res.status ?? 0;
+  } finally {
+    restore();
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Local commands
 // ---------------------------------------------------------------------------
 
-function cmdClass(args) {
+async function cmdClass(args) {
   const sub = args[0] ?? 'list';
 
   if (sub === 'list') {
@@ -250,7 +328,7 @@ function cmdClass(args) {
       const dest = path.join(classPaths(id, ROOT).sources, path.basename(src));
       fs.copyFileSync(src, dest);
       console.log(`Copied syllabus → ${path.relative(ROOT, dest)}`);
-      return forward(
+      return await forward(
         { slash: 'class', mode: 'print' },
         ['syllabus', id, path.relative(ROOT, dest)],
       );
@@ -279,7 +357,7 @@ async function cmdStatus(args) {
     const doc = readDoc(classPaths(id, ROOT).meta);
     console.log(`\n\x1b[1m${id}\x1b[0m ${doc?.data?.title ?? ''}`);
 
-    const topics = listTopics(id);
+    const topics = listTopics(id, ROOT);
     if (topics.length === 0) {
       console.log('  (no topics yet — ingest some notes)');
       continue;
@@ -303,22 +381,21 @@ async function cmdStatus(args) {
     }
     if (due.length > 6) console.log(`    \x1b[2m… and ${due.length - 6} more\x1b[0m`);
 
-    const recent = await query({ class: id, since: weekAgo }, ROOT);
-    const quizzes = recent.filter((e) => e.type === 'quiz');
-    const asked = quizzes.reduce((n, e) => n + (e.asked ?? 0), 0);
-    const correct = quizzes.reduce((n, e) => n + (e.correct ?? 0), 0);
+    const acc = await accuracySince(id, weekAgo, ROOT);
     console.log(
-      `  last 7d: ${recent.length} events` +
-        (asked ? `, quiz accuracy ${Math.round((correct / asked) * 100)}% (${correct}/${asked})` : ''),
+      `  last 7d: ${acc.events} events` +
+        (acc.ratio !== null
+          ? `, quiz accuracy ${Math.round(acc.ratio * 100)}% (${acc.correct}/${acc.asked})`
+          : ''),
     );
 
-    const upcoming = examsSoon(id);
+    const upcoming = examsSoon(id, ROOT);
     for (const e of upcoming) {
       console.log(`  \x1b[35m▲ ${e.name} in ${e.days}d\x1b[0m (${e.date})`);
     }
   }
 
-  const pending = inboxItems();
+  const pending = inboxItems(ROOT);
   if (pending.length) {
     console.log(`\n\x1b[36m${pending.length} item(s) waiting in inbox/\x1b[0m — run: studyos ingest`);
   }
@@ -489,6 +566,71 @@ function cmdAutomation(args) {
   return 1;
 }
 
+function cmdTheme(args) {
+  const sub = args[0] ?? 'status';
+
+  if (sub === 'status') {
+    const s = terminal.themeStatus(ROOT);
+    if (!s.supported) {
+      console.log(
+        `  Terminal styling is Apple Terminal only.\n` +
+          `  Detected: ${s.terminal} — studyos runs normally, just without recolouring.`,
+      );
+      return 0;
+    }
+    console.log(`  profile installed : ${s.installed ? 'yes' : 'no  (studyos theme install)'}`);
+    console.log(`  current profile   : ${s.current ?? 'unknown'}`);
+    if (s.pendingRestore) {
+      console.log(
+        `\n  \x1b[33mA session left the theme applied.\x1b[0m` +
+          `\n  Restore with: studyos theme restore  (back to "${s.pendingRestore}")`,
+      );
+    }
+    return 0;
+  }
+
+  if (sub === 'install') {
+    if (!terminal.isAppleTerminal()) {
+      console.error(
+        `studyos: theme install needs Apple Terminal (detected ${process.env.TERM_PROGRAM ?? 'unknown'}).`,
+      );
+      return 1;
+    }
+    const res = terminal.createProfile();
+    if (!res.ok) {
+      const stock = terminal.stockFallback();
+      console.error(`studyos: could not create the StudyOS profile — ${res.error}`);
+      if (stock) console.error(`  Falling back to the stock "${stock}" profile at launch.`);
+      return 1;
+    }
+    console.log(
+      res.created
+        ? `  ✓ Created the "${terminal.PROFILE}" Terminal profile.`
+        : `  ✓ "${terminal.PROFILE}" already installed.`,
+    );
+    console.log('    studyos switches to it on launch and restores your profile on exit.');
+    return 0;
+  }
+
+  if (sub === 'restore') {
+    const ok = terminal.deactivate(null, ROOT);
+    console.log(ok ? '  ✓ Restored your previous Terminal profile.' : '  Nothing to restore.');
+    return 0;
+  }
+
+  if (sub === 'uninstall') {
+    terminal.deactivate(null, ROOT);
+    const ok = terminal.removeProfile();
+    console.log(ok ? `  ✓ Removed the "${terminal.PROFILE}" profile.` : '  Could not remove it.');
+    return ok ? 0 : 1;
+  }
+
+  console.error(
+    `studyos theme: unknown subcommand "${sub}" (expected install, restore, status, uninstall)`,
+  );
+  return 1;
+}
+
 function cmdDoctor() {
   let ok = true;
   const check = (label, pass, detail = '') => {
@@ -536,39 +678,6 @@ function cmdDoctor() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function listTopics(classId) {
-  const dir = classPaths(classId, ROOT).topics;
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith('.md'))
-    .map((f) => ({ slug: f.replace(/\.md$/, ''), ...(readDoc(path.join(dir, f))?.data ?? {}) }))
-    .sort((a, b) => (a.mastery ?? 9) - (b.mastery ?? 9));
-}
-
-/** Exams within the next 21 days, from schedule.md frontmatter. */
-function examsSoon(classId, withinDays = 21) {
-  const doc = readDoc(classPaths(classId, ROOT).schedule);
-  const exams = doc?.data?.exams;
-  if (!Array.isArray(exams)) return [];
-
-  const now = Date.now();
-  return exams
-    .filter((e) => e && e.date)
-    .map((e) => ({ ...e, days: Math.ceil((new Date(e.date) - now) / 864e5) }))
-    .filter((e) => Number.isFinite(e.days) && e.days >= 0 && e.days <= withinDays)
-    .sort((a, b) => a.days - b.days);
-}
-
-/** Files awaiting ingest (top level of inbox/, ignoring _processed and dotfiles). */
-function inboxItems() {
-  if (!fs.existsSync(P.inbox)) return [];
-  return fs
-    .readdirSync(P.inbox, { withFileTypes: true })
-    .filter((e) => e.isFile() && !e.name.startsWith('.'))
-    .map((e) => e.name);
-}
 
 function mustResolve(input) {
   if (!input) {

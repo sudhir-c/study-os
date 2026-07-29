@@ -10,8 +10,9 @@ derived state honest, and decides when Claude runs.
 ## Install
 
 ```bash
-npm link          # puts `studyos` on your PATH
-studyos doctor    # check the install
+npm link                # puts `studyos` on your PATH
+studyos theme install   # optional: StudyOS Terminal.app profile
+studyos doctor          # check the install
 ```
 
 ## Use
@@ -64,19 +65,58 @@ notation.
 
 ```
 bin/studyos             CLI entry point
+bin/statusline          StudyOS status bar (reads the vault, not the session)
 bin/studyos-watch       launchd target: debounced inbox watcher
 lib/vault.js            frontmatter + path conventions
 lib/events.js           append-only event log
 lib/mastery.js          mastery derivation + spaced-repetition scheduling
+lib/dashboard.js        shared snapshot behind `status` and the status line
+lib/terminal.js         Terminal.app profile switching
 lib/automation.js       launchd plist generation
 lib/adapters/           apple-notes.js, folder.js
 .claude/skills/         study-os conventions (the shared contract)
 .claude/agents/         transcriber, quizmaster, planner, analyst
 .claude/commands/       /ingest /class /quiz /prep /plan /log /review
-inbox/                  drop zone
-vault/classes/<id>/     class.md, schedule.md, topics/, notes/, sources/, exams/
-vault/log/events.jsonl  source of truth
+inbox/                  drop zone (contents gitignored)
+vault/                  your notes and study log — gitignored, never pushed
 ```
+
+## Appearance
+
+`studyos` doesn't look like Claude Code. Three things change, and all of them
+apply **only** to `studyos` — running plain `claude` in this repo gives you
+ordinary Claude Code, because developing the tool and using it want opposite UI.
+
+- **Status line** — replaced with study state rather than session state:
+
+  ```
+  15-122 · loop-invariants ███░░ 3/5   ▲ Midterm in 4d
+  1 due · 2 never tested · inbox: 3 waiting · 73% acc
+  ```
+
+  Set `STUDYOS_STATUSLINE=compact` for a one-line version, or `NO_COLOR=1` for
+  plain text.
+
+- **Terminal profile** — `studyos theme install` creates a StudyOS profile for
+  Terminal.app; sessions switch to it on launch and restore your previous
+  profile on exit. Apple Terminal only; silently skipped elsewhere. If a session
+  is `kill -9`'d the restore is skipped, so `studyos theme restore` recovers it.
+
+- **Banner and session name** — an ASCII wordmark with live study state, and the
+  session is named `StudyOS`, which also retitles the terminal window.
+
+The separation is enforced by keeping the chrome in `.claude/studyos.settings.json`,
+loaded via `--settings` by the binary and never picked up automatically.
+
+Print-mode commands (`ingest`, `review`, `log`) emit **no** banner, colour, or
+status line — the watcher and nightly job parse that output.
+
+## Privacy
+
+`vault/` and the contents of `inbox/` are gitignored. Class notes, lecture
+sources, grades, instructor names, and the full study log stay on your machine.
+`ensureVault()` recreates the directory skeleton on every run, so a fresh clone
+works with nothing missing.
 
 ## The two-tier rule
 
@@ -115,5 +155,5 @@ Not yet exercised against real data: the interactive quiz loop and the live
 Apple Notes sync (which needs a one-time macOS Automation permission grant).
 
 ```bash
-npm test    # 58 tests
+npm test    # 71 tests
 ```

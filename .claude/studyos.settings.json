@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+
+  "//": "StudyOS chrome. Loaded ONLY by bin/studyos via --settings, never automatically. Keeping it out of .claude/settings.json is deliberate: a plain `claude` in this repo is for developing studyos and should look like ordinary Claude Code, while `studyos` is for studying and should not.",
+
+  "statusLine": {
+    "type": "command",
+    "command": "./bin/statusline",
+    "padding": 0
+  },
+
+  "spinnerTipsEnabled": false,
+  "theme": "dark"
+}

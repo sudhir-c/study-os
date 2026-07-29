@@ -1,0 +1,120 @@
+#!/usr/bin/env node
+/**
+ * studyos-watch — launchd WatchPaths target.
+ *
+ * WatchPaths fires on every filesystem change in inbox/, so dropping six PDFs
+ * fires up to six times, and a large file in mid-copy fires before it is
+ * complete. This wrapper handles both:
+ *
+ *   1. A lockfile collapses concurrent invocations into one. Losers exit
+ *      immediately — the holder will pick up their files too.
+ *   2. A settle loop waits until inbox/ stops changing before ingesting, so
+ *      partially-copied files are never read.
+ *
+ * Then it hands off to `studyos ingest`.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { projectRoot, paths } from '../lib/vault.js';
+
+const ROOT = projectRoot();
+const P = paths(ROOT);
+const LOCK = path.join(P.inbox, '.lock');
+
+const SETTLE_MS = 3000; // quiet period required before ingesting
+const MAX_SETTLE_MS = 120_000; // give up waiting after this
+const STALE_LOCK_MS = 30 * 60_000; // assume a lock older than this is orphaned
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const stamp = () => new Date().toISOString();
+const log = (msg) => console.log(`[${stamp()}] watch: ${msg}`);
+
+/** Files awaiting ingest, with sizes — the snapshot we compare for settling. */
+function snapshot() {
+  if (!fs.existsSync(P.inbox)) return '';
+  return fs
+    .readdirSync(P.inbox, { withFileTypes: true })
+    .filter((e) => e.isFile() && !e.name.startsWith('.'))
+    .map((e) => {
+      const s = fs.statSync(path.join(P.inbox, e.name));
+      return `${e.name}:${s.size}:${s.mtimeMs}`;
+    })
+    .sort()
+    .join('|');
+}
+
+function acquireLock() {
+  try {
+    // 'wx' fails if the file exists — atomic against concurrent invocations.
+    fs.writeFileSync(LOCK, String(process.pid), { flag: 'wx' });
+    return true;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    const age = Date.now() - fs.statSync(LOCK).mtimeMs;
+    if (age > STALE_LOCK_MS) {
+      log(`stealing stale lock (${Math.round(age / 60000)}m old)`);
+      fs.rmSync(LOCK, { force: true });
+      return acquireLock();
+    }
+    return false;
+  }
+}
+
+function releaseLock() {
+  try {
+    fs.rmSync(LOCK, { force: true });
+  } catch {
+    /* best effort */
+  }
+}
+
+if (snapshot() === '') process.exit(0); // nothing pending; don't take the lock
+
+if (!acquireLock()) {
+  log('another run holds the lock — deferring to it');
+  process.exit(0);
+}
+
+process.on('exit', releaseLock);
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    releaseLock();
+    process.exit(1);
+  });
+}
+
+try {
+  // Wait for inbox/ to stop changing.
+  const start = Date.now();
+  let last = snapshot();
+  for (;;) {
+    await sleep(SETTLE_MS);
+    const now = snapshot();
+    if (now === last) break;
+    if (Date.now() - start > MAX_SETTLE_MS) {
+      log('inbox still changing after 2m — ingesting what is there');
+      break;
+    }
+    last = now;
+  }
+
+  if (snapshot() === '') {
+    log('inbox emptied while settling — nothing to do');
+    process.exit(0);
+  }
+
+  const count = snapshot().split('|').length;
+  log(`ingesting ${count} item(s)`);
+
+  const res = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'studyos'), 'ingest'], {
+    cwd: ROOT,
+    stdio: 'inherit',
+  });
+
+  log(res.status === 0 ? 'done' : `ingest exited ${res.status}`);
+  process.exit(res.status ?? 0);
+} finally {
+  releaseLock();
+}

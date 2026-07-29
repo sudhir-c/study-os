@@ -1,0 +1,631 @@
+#!/usr/bin/env node
+/**
+ * studyos — the command-line entry point.
+ *
+ * Deliberately thin. Slash commands in .claude/commands/ are the real
+ * implementation of anything that requires reasoning; this binary only
+ * resolves the vault, handles the cheap local queries that shouldn't cost
+ * tokens (list/show/status), and forwards everything else to `claude` with
+ * the project root as cwd so .claude/ config applies.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import {
+  projectRoot,
+  paths,
+  ensureVault,
+  listClasses,
+  resolveClass,
+  classPaths,
+  createClass,
+  readDoc,
+  slugify,
+} from '../lib/vault.js';
+import { query } from '../lib/events.js';
+import { rebuildClass, dueTopics } from '../lib/mastery.js';
+import * as automation from '../lib/automation.js';
+
+const ROOT = projectRoot();
+const P = paths(ROOT);
+
+/**
+ * Always Opus, never Fable.
+ *
+ * Pinned rather than inherited from the user's global setting so a change to
+ * that default can't silently move the vault onto a different model — the
+ * transcriber's judgement about unreadable handwriting and the quizmaster's
+ * grading both feed the permanent event log, so consistency matters more here
+ * than picking up whatever is currently default.
+ *
+ * `opus` is the alias for the latest Opus, so this tracks new Opus releases;
+ * `[1m]` selects the 1M-token context, which the analyst needs to read the
+ * whole event log alongside a semester of notes. Override with STUDYOS_MODEL.
+ */
+const MODEL = process.env.STUDYOS_MODEL || 'opus[1m]';
+
+// ---------------------------------------------------------------------------
+// Command table
+//
+// mode: 'local'       — handled here, never invokes Claude
+//       'interactive' — opens a Claude session (conversational by nature)
+//       'print'       — one-shot `claude -p`, safe to run from launchd
+// ---------------------------------------------------------------------------
+
+const COMMANDS = {
+  pull: { mode: 'local', help: '<notes|folder DIR> Pull notes from a source into inbox/' },
+  ingest: { mode: 'print', slash: 'ingest', help: '[path]           Transcribe and file inbox items' },
+  class: { mode: 'local', help: '<add|list|show>   Manage classes' },
+  quiz: { mode: 'interactive', slash: 'quiz', help: '<class> [opts]    Generate and grade questions' },
+  prep: { mode: 'interactive', slash: 'prep', help: '<class> --exam F  Work a practice test' },
+  plan: { mode: 'interactive', slash: 'plan', help: '[today|week]      Build a study plan' },
+  log: { mode: 'print', slash: 'log', help: '"<what you did>"  Record a study session' },
+  review: { mode: 'print', slash: 'review', help: '[--class X]       Analyst pass over your history' },
+  status: { mode: 'local', help: '[class]           Dashboard: mastery, due, upcoming' },
+  rebuild: { mode: 'local', help: '[class]           Rebuild derived caches from events.jsonl' },
+  automation: { mode: 'local', help: '<enable|disable|status>  Background watcher + nightly review' },
+  doctor: { mode: 'local', help: '                  Check the install' },
+  help: { mode: 'local', help: '                  Show this' },
+};
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+const argv = process.argv.slice(2);
+
+// Bare `studyos` opens an interactive session over the vault.
+if (argv.length === 0) {
+  ensureVault(ROOT);
+  exitWith(runClaude([], { interactive: true }));
+}
+
+const name = argv[0];
+const rest = argv.slice(1);
+
+if (name === '--version' || name === '-v') {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  console.log(`studyos ${pkg.version}`);
+  process.exit(0);
+}
+
+if (name === '--help' || name === '-h' || name === 'help') {
+  usage();
+  process.exit(0);
+}
+
+const cmd = COMMANDS[name];
+if (!cmd) {
+  console.error(`studyos: unknown command "${name}"\n`);
+  usage();
+  process.exit(1);
+}
+
+ensureVault(ROOT);
+
+switch (name) {
+  case 'class':
+    exitWith(cmdClass(rest));
+    break;
+  case 'status':
+    exitWith(await cmdStatus(rest));
+    break;
+  case 'rebuild':
+    exitWith(await cmdRebuild(rest));
+    break;
+  case 'pull':
+    exitWith(await cmdPull(rest));
+    break;
+  case 'automation':
+    exitWith(cmdAutomation(rest));
+    break;
+  case 'doctor':
+    exitWith(cmdDoctor());
+    break;
+  default:
+    exitWith(forward(cmd, rest));
+}
+
+// ---------------------------------------------------------------------------
+// Claude forwarding
+// ---------------------------------------------------------------------------
+
+/** Build a `/slash arg arg` invocation and hand it to Claude. */
+function forward(cmd, args) {
+  const slashFile = path.join(ROOT, '.claude', 'commands', `${cmd.slash}.md`);
+  if (!fs.existsSync(slashFile)) {
+    console.error(
+      `studyos: /${cmd.slash} is not implemented yet.\n` +
+        `  Expected: ${path.relative(ROOT, slashFile)}`,
+    );
+    return 1;
+  }
+
+  // --interactive forces a session even for one-shot commands, and vice versa.
+  let interactive = cmd.mode === 'interactive';
+  const passthrough = [];
+  for (const a of args) {
+    if (a === '--interactive' || a === '-i') interactive = true;
+    else if (a === '--print' || a === '-p') interactive = false;
+    else passthrough.push(a);
+  }
+
+  const prompt = [`/${cmd.slash}`, ...passthrough.map(quoteArg)].join(' ');
+  return runClaude([prompt], { interactive });
+}
+
+function quoteArg(a) {
+  return /[\s"']/.test(a) ? JSON.stringify(a) : a;
+}
+
+function runClaude(promptArgs, { interactive }) {
+  const args = ['--model', MODEL];
+  if (!interactive) {
+    args.push('--print');
+    // The vault is the user's own data and every write is confined to it;
+    // prompting for each file edit would make the watcher unusable.
+    args.push('--permission-mode', 'acceptEdits');
+  }
+  args.push(...promptArgs);
+
+  const res = spawnSync('claude', args, { cwd: ROOT, stdio: 'inherit' });
+  if (res.error) {
+    if (res.error.code === 'ENOENT') {
+      console.error('studyos: `claude` not found on PATH. Install Claude Code first.');
+      return 127;
+    }
+    console.error(`studyos: ${res.error.message}`);
+    return 1;
+  }
+  return res.status ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// Local commands
+// ---------------------------------------------------------------------------
+
+function cmdClass(args) {
+  const sub = args[0] ?? 'list';
+
+  if (sub === 'list') {
+    const ids = listClasses(ROOT);
+    if (ids.length === 0) {
+      console.log('No classes yet. Add one:\n  studyos class add 15-122 --title "Imperative Computation"');
+      return 0;
+    }
+    for (const id of ids) {
+      const doc = readDoc(classPaths(id, ROOT).meta);
+      const title = doc?.data?.title ?? '';
+      const term = doc?.data?.term ? ` (${doc.data.term})` : '';
+      console.log(`  ${id.padEnd(12)} ${title}${term}`);
+    }
+    return 0;
+  }
+
+  if (sub === 'show') {
+    const id = mustResolve(args[1]);
+    if (!id) return 1;
+    const p = classPaths(id, ROOT);
+    console.log(fs.readFileSync(p.meta, 'utf8'));
+    const topics = listTopics(id);
+    if (topics.length) {
+      console.log(`\n## Topics (${topics.length})\n`);
+      for (const t of topics) {
+        console.log(`  ${String(t.topic ?? t.slug).padEnd(28)} mastery ${t.mastery ?? '-'}/5`);
+      }
+    }
+    return 0;
+  }
+
+  if (sub === 'add') {
+    const id = args[1];
+    if (!id) {
+      console.error('usage: studyos class add <id> [--title T] [--term T] [--instructor N] [--syllabus FILE]');
+      return 1;
+    }
+    if (listClasses(ROOT).includes(id)) {
+      console.error(`studyos: class "${id}" already exists`);
+      return 1;
+    }
+    const opts = parseFlags(args.slice(2));
+    createClass(
+      id,
+      {
+        title: opts.title,
+        term: opts.term,
+        instructor: opts.instructor,
+        aliases: opts.alias ? [].concat(opts.alias) : [],
+      },
+      ROOT,
+    );
+    console.log(`Created ${path.relative(ROOT, classPaths(id, ROOT).dir)}/`);
+
+    if (opts.syllabus) {
+      const src = path.resolve(opts.syllabus);
+      if (!fs.existsSync(src)) {
+        console.error(`studyos: syllabus not found: ${src}`);
+        return 1;
+      }
+      const dest = path.join(classPaths(id, ROOT).sources, path.basename(src));
+      fs.copyFileSync(src, dest);
+      console.log(`Copied syllabus → ${path.relative(ROOT, dest)}`);
+      return forward(
+        { slash: 'class', mode: 'print' },
+        ['syllabus', id, path.relative(ROOT, dest)],
+      );
+    }
+    console.log(`\nNext: studyos class add ${id} --syllabus path/to/syllabus.pdf  (or drop notes in inbox/)`);
+    return 0;
+  }
+
+  console.error(`studyos class: unknown subcommand "${sub}" (expected add, list, show)`);
+  return 1;
+}
+
+async function cmdStatus(args) {
+  const only = args[0] ? mustResolve(args[0]) : null;
+  if (args[0] && !only) return 1;
+
+  const ids = only ? [only] : listClasses(ROOT);
+  if (ids.length === 0) {
+    console.log('No classes yet. Add one:  studyos class add 15-122');
+    return 0;
+  }
+
+  const weekAgo = new Date(Date.now() - 7 * 864e5).toISOString();
+
+  for (const id of ids) {
+    const doc = readDoc(classPaths(id, ROOT).meta);
+    console.log(`\n\x1b[1m${id}\x1b[0m ${doc?.data?.title ?? ''}`);
+
+    const topics = listTopics(id);
+    if (topics.length === 0) {
+      console.log('  (no topics yet — ingest some notes)');
+      continue;
+    }
+
+    // Derived from events, so this is correct even if topic files are stale.
+    const due = await dueTopics(id, ROOT);
+    const untested = due.filter((d) => d.mastery === null);
+    const overdue = due.filter((d) => d.mastery !== null);
+
+    console.log(
+      `  topics: ${topics.length}   due for review: ${overdue.length}   never tested: ${untested.length}`,
+    );
+    for (const t of due.slice(0, 6)) {
+      const label = t.mastery === null ? '\x1b[36mnew\x1b[0m ' : '\x1b[33mdue\x1b[0m ';
+      const bar = t.mastery === null ? '     -' : `${'█'.repeat(t.mastery)}${'░'.repeat(5 - t.mastery)} ${t.mastery}`;
+      console.log(`    ${label} ${String(t.topic).padEnd(26)} ${bar}`);
+      if (t.confusions?.length) {
+        console.log(`          \x1b[2m↳ ${t.confusions.slice(0, 2).join('; ')}\x1b[0m`);
+      }
+    }
+    if (due.length > 6) console.log(`    \x1b[2m… and ${due.length - 6} more\x1b[0m`);
+
+    const recent = await query({ class: id, since: weekAgo }, ROOT);
+    const quizzes = recent.filter((e) => e.type === 'quiz');
+    const asked = quizzes.reduce((n, e) => n + (e.asked ?? 0), 0);
+    const correct = quizzes.reduce((n, e) => n + (e.correct ?? 0), 0);
+    console.log(
+      `  last 7d: ${recent.length} events` +
+        (asked ? `, quiz accuracy ${Math.round((correct / asked) * 100)}% (${correct}/${asked})` : ''),
+    );
+
+    const upcoming = examsSoon(id);
+    for (const e of upcoming) {
+      console.log(`  \x1b[35m▲ ${e.name} in ${e.days}d\x1b[0m (${e.date})`);
+    }
+  }
+
+  const pending = inboxItems();
+  if (pending.length) {
+    console.log(`\n\x1b[36m${pending.length} item(s) waiting in inbox/\x1b[0m — run: studyos ingest`);
+  }
+  console.log('');
+  return 0;
+}
+
+async function cmdRebuild(args) {
+  const only = args[0] ? mustResolve(args[0]) : null;
+  if (args[0] && !only) return 1;
+
+  const ids = only ? [only] : listClasses(ROOT);
+  if (ids.length === 0) {
+    console.log('No classes to rebuild.');
+    return 0;
+  }
+
+  for (const id of ids) {
+    const { updated, created } = await rebuildClass(id, ROOT);
+    console.log(
+      `${id}: ${updated.length} updated, ${created.length} recreated` +
+        (created.length ? `  (${created.join(', ')})` : ''),
+    );
+  }
+  console.log(
+    '\nDerived frontmatter recomputed from events.jsonl.' +
+      '\nTopic bodies are not reconstructible from the log — recreated files are' +
+      '\nstubs listing the source notes to refill them from.',
+  );
+  return 0;
+}
+
+async function cmdPull(args) {
+  const source = args[0];
+  const opts = parseFlags(args.slice(1));
+
+  if (source === 'notes' || source === 'apple-notes') {
+    const { sync } = await import('../lib/adapters/apple-notes.js');
+    const res = sync({
+      folder: typeof opts.folder === 'string' ? opts.folder : undefined,
+      all: !!opts.all,
+      dryRun: !!opts['dry-run'],
+      root: ROOT,
+    });
+    if (!res.ok) {
+      console.error(`studyos: ${res.error}`);
+      return 1;
+    }
+    console.log(
+      `  ${res.written.length} written, ${res.skipped.length} unchanged` +
+        (opts['dry-run'] ? '  (dry run — nothing copied)' : ''),
+    );
+    for (const f of res.written.slice(0, 10)) console.log(`    + ${f}`);
+    if (res.written.length > 10) console.log(`    … and ${res.written.length - 10} more`);
+
+    if (res.emptyBodies.length) {
+      console.log(
+        `\n  \x1b[33m${res.emptyBodies.length} note(s) had no extractable text.\x1b[0m\n` +
+          `  Apple Notes handwriting is not reachable via AppleScript — for those,\n` +
+          `  use Share → Export as PDF into inbox/ instead:`,
+      );
+      for (const n of res.emptyBodies.slice(0, 8)) console.log(`    · ${n}`);
+    }
+    if (res.written.length) console.log(`\n  Next: studyos ingest`);
+    return 0;
+  }
+
+  if (source === 'folder') {
+    const dir = args[1];
+    if (!dir || dir.startsWith('--')) {
+      console.error('usage: studyos pull folder <dir> [--recursive] [--prefix P] [--all] [--dry-run]');
+      return 1;
+    }
+    const { sync } = await import('../lib/adapters/folder.js');
+    const res = sync(dir, {
+      recursive: !!opts.recursive,
+      all: !!opts.all,
+      dryRun: !!opts['dry-run'],
+      prefix: typeof opts.prefix === 'string' ? opts.prefix : '',
+      root: ROOT,
+    });
+    if (!res.ok) {
+      console.error(`studyos: ${res.error}`);
+      return 1;
+    }
+    console.log(
+      `  ${res.copied.length} copied, ${res.skipped.length} unchanged, ${res.ignored.length} unsupported` +
+        (opts['dry-run'] ? '  (dry run — nothing copied)' : ''),
+    );
+    for (const f of res.copied.slice(0, 10)) console.log(`    + ${f}`);
+    if (res.copied.length > 10) console.log(`    … and ${res.copied.length - 10} more`);
+    if (res.copied.length) console.log(`\n  Next: studyos ingest`);
+    return 0;
+  }
+
+  console.error(
+    'usage: studyos pull notes [--folder "School"] [--all] [--dry-run]\n' +
+      '       studyos pull folder <dir> [--recursive] [--prefix P]\n\n' +
+      '  notes   typed Apple Notes via AppleScript (handwriting is not reachable —\n' +
+      '          export those as PDF into inbox/ instead)\n' +
+      '  folder  any export directory: GoodNotes, Notability, a scanner app',
+  );
+  return 1;
+}
+
+function cmdAutomation(args) {
+  const sub = args[0] ?? 'status';
+  const which = args[1]; // optional: 'watch' | 'nightly'
+  const targets = which ? [which] : ['watch', 'nightly'];
+
+  for (const t of targets) {
+    if (!['watch', 'nightly'].includes(t)) {
+      console.error(`studyos: unknown agent "${t}" (expected watch or nightly)`);
+      return 1;
+    }
+  }
+
+  if (sub === 'status') {
+    for (const t of targets) {
+      const s = automation.status(t);
+      const state = !s.installed ? 'not installed' : s.loaded ? 'running' : 'installed, not loaded';
+      console.log(`  ${t.padEnd(8)} ${state}`);
+      if (s.installed) console.log(`           ${s.file}`);
+    }
+    console.log(`\n  log: ${path.join(P.log, 'automation.log')}`);
+    return 0;
+  }
+
+  if (sub === 'enable') {
+    const opts = parseFlags(args.slice(1));
+    let hour = 23;
+    let minute = 0;
+    if (typeof opts.at === 'string') {
+      const m = opts.at.match(/^(\d{1,2}):(\d{2})$/);
+      if (!m) {
+        console.error(`studyos: --at expects HH:MM, got "${opts.at}"`);
+        return 1;
+      }
+      hour = Number(m[1]);
+      minute = Number(m[2]);
+    }
+
+    for (const t of targets) {
+      const res = automation.enable(t, ROOT, { hour, minute });
+      if (!res.ok) {
+        console.error(`studyos: failed to load ${t} — ${res.error}`);
+        return 1;
+      }
+      console.log(`  ✓ ${t} enabled  (${path.basename(res.file)})`);
+    }
+    console.log(
+      `\nThe watcher ingests anything dropped in inbox/.\n` +
+        `The nightly review runs at ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} and spends tokens unattended.\n` +
+        `Disable either with: studyos automation disable [watch|nightly]`,
+    );
+    return 0;
+  }
+
+  if (sub === 'disable') {
+    for (const t of targets) {
+      automation.disable(t);
+      console.log(`  ✓ ${t} disabled`);
+    }
+    return 0;
+  }
+
+  console.error(`studyos automation: unknown subcommand "${sub}" (expected enable, disable, status)`);
+  return 1;
+}
+
+function cmdDoctor() {
+  let ok = true;
+  const check = (label, pass, detail = '') => {
+    console.log(`  ${pass ? '\x1b[32m✓\x1b[0m' : '\x1b[31m✗\x1b[0m'} ${label}${detail ? `  ${detail}` : ''}`);
+    if (!pass) ok = false;
+  };
+
+  console.log(`\nstudy-os at ${ROOT}\n`);
+  const claude = spawnSync('claude', ['--version'], { encoding: 'utf8' });
+  check('claude CLI', !claude.error, (claude.stdout ?? '').trim());
+  check(
+    'model',
+    !/fable/i.test(MODEL),
+    MODEL + (process.env.STUDYOS_MODEL ? '  (from STUDYOS_MODEL)' : '  (pinned)'),
+  );
+  check('vault/', fs.existsSync(P.vault));
+  check('events.jsonl', fs.existsSync(P.events));
+  check('inbox/', fs.existsSync(P.inbox));
+  check('study-os skill', fs.existsSync(path.join(ROOT, '.claude/skills/study-os/SKILL.md')));
+
+  const agentsDir = path.join(ROOT, '.claude/agents');
+  const wanted = ['transcriber', 'quizmaster', 'planner', 'analyst'];
+  const present = wanted.filter((a) => fs.existsSync(path.join(agentsDir, `${a}.md`)));
+  check('agents', present.length === wanted.length, present.join(' '));
+
+  const cmds = fs.existsSync(path.join(ROOT, '.claude/commands'))
+    ? fs.readdirSync(path.join(ROOT, '.claude/commands')).filter((f) => f.endsWith('.md'))
+    : [];
+  check('slash commands', cmds.length > 0, cmds.map((c) => '/' + c.replace(/\.md$/, '')).join(' '));
+
+  const classes = listClasses(ROOT);
+  check('classes registered', classes.length > 0, classes.join(' ') || '(none — studyos class add ...)');
+
+  for (const which of ['watch', 'nightly']) {
+    const s = automation.status(which);
+    console.log(
+      `  ${s.loaded ? '\x1b[32m✓\x1b[0m' : '\x1b[2m·\x1b[0m'} automation:${which}` +
+        `  ${s.loaded ? 'running' : 'off (studyos automation enable)'}`,
+    );
+  }
+  console.log('');
+  return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function listTopics(classId) {
+  const dir = classPaths(classId, ROOT).topics;
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith('.md'))
+    .map((f) => ({ slug: f.replace(/\.md$/, ''), ...(readDoc(path.join(dir, f))?.data ?? {}) }))
+    .sort((a, b) => (a.mastery ?? 9) - (b.mastery ?? 9));
+}
+
+/** Exams within the next 21 days, from schedule.md frontmatter. */
+function examsSoon(classId, withinDays = 21) {
+  const doc = readDoc(classPaths(classId, ROOT).schedule);
+  const exams = doc?.data?.exams;
+  if (!Array.isArray(exams)) return [];
+
+  const now = Date.now();
+  return exams
+    .filter((e) => e && e.date)
+    .map((e) => ({ ...e, days: Math.ceil((new Date(e.date) - now) / 864e5) }))
+    .filter((e) => Number.isFinite(e.days) && e.days >= 0 && e.days <= withinDays)
+    .sort((a, b) => a.days - b.days);
+}
+
+/** Files awaiting ingest (top level of inbox/, ignoring _processed and dotfiles). */
+function inboxItems() {
+  if (!fs.existsSync(P.inbox)) return [];
+  return fs
+    .readdirSync(P.inbox, { withFileTypes: true })
+    .filter((e) => e.isFile() && !e.name.startsWith('.'))
+    .map((e) => e.name);
+}
+
+function mustResolve(input) {
+  if (!input) {
+    console.error('studyos: a class is required');
+    return null;
+  }
+  let id;
+  try {
+    id = resolveClass(input, ROOT);
+  } catch (e) {
+    console.error(`studyos: ${e.message}`);
+    return null;
+  }
+  if (!id) {
+    console.error(`studyos: no such class "${input}". Known: ${listClasses(ROOT).join(', ') || '(none)'}`);
+    return null;
+  }
+  return id;
+}
+
+/** Minimal `--key value` / `--flag` parser. Repeated keys collect into arrays. */
+function parseFlags(args) {
+  const out = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('--')) continue;
+    const key = a.slice(2);
+    const next = args[i + 1];
+    const value = next && !next.startsWith('--') ? (i++, next) : true;
+    if (key in out) out[key] = [].concat(out[key], value);
+    else out[key] = value;
+  }
+  return out;
+}
+
+function usage() {
+  console.log(`
+studyos — a study OS over your class notes
+
+  studyos                        Open an interactive session over the vault
+
+Commands:`);
+  for (const [n, c] of Object.entries(COMMANDS)) {
+    console.log(`  studyos ${n.padEnd(8)} ${c.help}`);
+  }
+  console.log(`
+Examples:
+  studyos class add 15-122 --title "Imperative Computation" --syllabus ~/syl.pdf
+  studyos ingest                 Process everything sitting in inbox/
+  studyos quiz 15-122 --topic invariants -n 10
+  studyos plan today
+  studyos log "2hr on graphs, stuck on the Dijkstra correctness proof"
+
+Vault: ${P.vault}
+`);
+}
+
+function exitWith(code) {
+  process.exit(typeof code === 'number' ? code : 0);
+}

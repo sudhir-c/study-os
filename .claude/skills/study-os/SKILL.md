@@ -1,0 +1,144 @@
+---
+name: study-os
+description: Conventions for the study-os vault — where class notes, topics, schedules, and the event log live, how frontmatter is encoded, and how to record events. Load this before reading or writing anything under vault/.
+---
+
+# study-os vault conventions
+
+This is the shared contract. Every command and subagent in this project reads and
+writes the vault through these rules. If you are about to touch anything under
+`vault/`, follow what is here rather than inventing a layout.
+
+## Layout
+
+```
+vault/
+├── classes/<class-id>/          # e.g. 15-122, 21-241
+│   ├── class.md                 # long-term memory for the class
+│   ├── schedule.md              # parsed syllabus: dates, exams, weights
+│   ├── topics/<topic-slug>.md   # one per topic, mastery in frontmatter
+│   ├── notes/YYYY-MM-DD-<slug>.md
+│   ├── sources/                 # original PDFs/images, never edited
+│   └── exams/                   # practice tests + postmortems
+└── log/
+    ├── events.jsonl             # append-only source of truth
+    └── daily/YYYY-MM-DD.md      # daily plan + reflection
+```
+
+`<class-id>` is the course number as the school writes it (`15-122`), lowercased
+and hyphenated if it isn't already. Topic slugs are lowercase-hyphenated
+(`loop-invariants`, `big-o-analysis`).
+
+## The two-tier rule
+
+`vault/log/events.jsonl` is the **source of truth**. Everything else — topic
+mastery numbers, class stats, dashboards — is a **derived cache** that must be
+reconstructible from the log alone.
+
+Consequences you must respect:
+
+- Any fact about *performance* (a quiz result, a session, an exam score) gets
+  written as an event **first**. Updating a topic file without logging an event
+  creates state that `studyos rebuild` will silently erase.
+- Never edit or delete a line in `events.jsonl`. It is append-only.
+- Topic frontmatter numbers are caches. It is fine to recompute them.
+
+## Frontmatter encoding
+
+Frontmatter is **not full YAML**. It is a restricted subset that `lib/vault.js`
+parses by trying `JSON.parse` on each value and falling back to a raw string.
+When you write frontmatter by hand:
+
+- Arrays must be **inline JSON**: `confusions: ["mixes up X with Y"]`
+  — not YAML block lists. (Block lists are tolerated on read, but always
+  re-serialized as JSON, so don't rely on them.)
+- Strings containing `:`, `#`, or leading/trailing spaces must be JSON-quoted.
+- Plain identifiers, dates, and numbers can be bare: `class: 15-122`,
+  `next_review: 2026-09-17`, `mastery: 3`.
+- `# comment` at the end of a line is stripped (but not inside quotes or arrays).
+
+Prefer going through `lib/vault.js` (`readDoc`, `writeDoc`, `patchDoc`) over
+hand-writing files when you are already running Node.
+
+## Accumulate, don't overwrite
+
+`class.md` and `topics/*.md` are long-lived memory that grows all semester.
+When you learn something new about a class or topic, **append to or merge into**
+the existing file. Read it first. Never clobber a file that already has content
+unless you are explicitly told to replace it.
+
+`patchDoc(file, patch)` in `lib/vault.js` merges frontmatter keys while leaving
+the body untouched — use it for mechanical updates.
+
+## Topic files
+
+```markdown
+---
+class: 15-122
+topic: loop-invariants
+mastery: 2
+attempts: 7
+last_reviewed: 2026-09-14
+next_review: 2026-09-17
+confusions: ["mixes up loop invariant with postcondition"]
+sources: ["notes/2026-09-09-lecture-04.md"]
+---
+
+## Summary
+
+## Key results
+
+## Worked examples
+
+## Where I go wrong
+```
+
+`mastery` is 0–5:
+
+| | |
+|---|---|
+| 0 | seen it, can't use it |
+| 1 | recognizes it, needs the notes open |
+| 2 | can do routine cases with hints |
+| 3 | reliable on routine cases unaided |
+| 4 | handles novel, multi-step applications |
+| 5 | can derive it and explain why it works |
+
+## Events
+
+Append with the helper — it validates the type and guarantees a well-formed line:
+
+```bash
+node lib/log-event.js '{"type":"quiz","class":"15-122","topic":"loop-invariants","asked":8,"correct":5,"missed":["loop invariant at exit","termination metric"]}'
+```
+
+Types and their conventional fields (`ts` is added automatically):
+
+| type | fields |
+|---|---|
+| `ingest` | `class`, `source` (original filename), `note` (written path), `topics[]`, `pages`, `confidence` |
+| `quiz` | `class`, `topic`, `asked`, `correct`, `missed[]` |
+| `session` | `class`, `topic`, `minutes`, `what`, `stuck[]` |
+| `exam` | `class`, `exam`, `score`, `max`, `missed[]`, `topics[]` |
+| `plan` | `class`, `horizon`, `items[]` |
+| `reflect` | `class`, `note` |
+
+**`missed[]` carries concepts, not question numbers.** `"termination metric"` is
+useful to the analyst and the planner; `"Q3b"` is not.
+
+**Paths in events are class-relative** — the event already carries `class`, so
+write `"note":"notes/2026-09-09-loop-invariants.md"`, never
+`"vault/classes/15-122/notes/..."`. The same applies to `source` and any other
+path field, and it matches the `source:` field in note frontmatter. Mixed
+conventions in an append-only log can't be cleaned up later, so get this right
+on the way in.
+
+## Style for note files
+
+Transcribed notes are faithful records, not summaries. Preserve the original
+structure, notation, and worked examples. Math goes in LaTeX (`$...$`,
+`$$...$$`), code in fenced blocks with a language tag. Describe diagrams in a
+short italic caption rather than dropping them.
+
+Mark anything you could not read confidently as `<!-- ?? original unclear -->`
+inline. A flagged gap is recoverable; a confident guess is not.

@@ -1,0 +1,17 @@
+{
+  "name": "study-os",
+  "version": "0.1.0",
+  "description": "A command-line study OS: persistent per-class memory, note ingestion, and a Claude Code harness over it.",
+  "type": "module",
+  "bin": {
+    "studyos": "./bin/studyos"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "private": true
+}

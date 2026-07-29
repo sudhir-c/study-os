@@ -1,0 +1,19 @@
+node_modules/
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Personal study data — never commit.
+#
+# This repo is public. The vault holds class notes, lecture sources, exam
+# postmortems, grades, instructor names, and the full study log; inbox/ holds
+# whatever you most recently dropped in. None of it belongs on GitHub.
+#
+# Nothing breaks from their absence: ensureVault() in lib/vault.js recreates
+# the directory skeleton on every run, so a fresh clone self-heals.
+# ---------------------------------------------------------------------------
+vault/
+inbox/*
+!inbox/.gitkeep
+
+# Local overrides
+.claude/settings.local.json

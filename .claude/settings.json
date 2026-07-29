@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "opus[1m]",
+  "permissions": {
+    "allow": [
+      "Bash(node lib/log-event.js:*)",
+      "Bash(npm test)",
+      "Bash(mkdir -p vault/:*)",
+      "Bash(mkdir -p inbox/:*)",
+      "Bash(mv inbox/:*)",
+      "Bash(ls:*)",
+      "Bash(find vault:*)",
+      "Bash(find inbox:*)",
+      "Bash(./bin/studyos:*)",
+      "Read(/**)",
+      "Edit(/vault/**)",
+      "Edit(/inbox/**)"
+    ],
+    "deny": [
+      "Bash(rm:*)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  }
+}

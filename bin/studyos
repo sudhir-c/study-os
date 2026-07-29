@@ -225,6 +225,16 @@ async function runClaude(promptArgs, { interactive }) {
   };
 
   if (interactive) {
+    // Claude Code draws its own welcome box at startup and there is no setting
+    // to suppress it — no banner/welcome/splash/logo key exists. Clearing the
+    // viewport first is the honest compromise: the StudyOS wordmark opens a
+    // clean window, and their box follows once and then scrolls away.
+    //
+    // \x1b[2J\x1b[H clears the visible screen and homes the cursor. Note the
+    // absence of \x1b[3J — that would also wipe the scrollback buffer, and
+    // destroying the terminal history you were working in is not ours to do.
+    if (process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[H');
+
     console.log(BANNER);
     const status = await bannerStatus();
     if (status) console.log(`  \x1b[2m${status}\x1b[0m\n`);

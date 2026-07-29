@@ -103,7 +103,13 @@ ordinary Claude Code, because developing the tool and using it want opposite UI.
   is `kill -9`'d the restore is skipped, so `studyos theme restore` recovers it.
 
 - **Banner and session name** — an ASCII wordmark with live study state, and the
-  session is named `StudyOS`, which also retitles the terminal window.
+  session is named `StudyOS`, which also retitles the terminal window. Launching
+  clears the viewport first (scrollback is preserved) so the wordmark opens a
+  clean window.
+
+  **Claude Code's own startup box can't be hidden** — there is no banner,
+  welcome, splash, or logo setting to suppress it. It appears once after the
+  StudyOS banner and scrolls away as you work.
 
 The separation is enforced by keeping the chrome in `.claude/studyos.settings.json`,
 loaded via `--settings` by the binary and never picked up automatically.

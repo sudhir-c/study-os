@@ -1,0 +1,354 @@
+#!/usr/bin/env node
+/**
+ * studyos-sheet — live handwriting grading.
+ *
+ * Shows one question at a time. You write the answer on the iPad, press Enter,
+ * and the page you just worked is graded before you move on — feedback arrives
+ * while the problem is still in your head, which is the whole pedagogical point
+ * of doing this live rather than in a batch at the end.
+ *
+ * Rendered entirely by StudyOS. Claude Code runs headless underneath
+ * (`--input-format stream-json --output-format stream-json`), which was measured
+ * at ~2.2s per follow-up turn and reaches first byte considerably sooner than
+ * print mode. That also means none of Claude Code's own chrome appears — the
+ * welcome box that can't be configured away simply never renders.
+ *
+ * A quiz is a narrow interaction: display text, read a line, repeat. It needs
+ * none of Claude Code's permission prompts, diffs, or editor UI, which is why
+ * owning the frontend here is cheap where owning it for a general session
+ * would not be.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+import { spawn } from 'node:child_process';
+import { projectRoot } from '../lib/vault.js';
+import * as sheet from '../lib/sheet.js';
+import { pageToPng, inkFraction } from '../lib/pdfpage.js';
+
+const ROOT = projectRoot();
+const MODEL = process.env.STUDYOS_MODEL || 'opus[1m]';
+
+/** Ink coverage at or below this is a page with only the printed question. */
+const BLANK_INK_CEILING = 0.009;
+
+const COLOR = !process.env.NO_COLOR;
+const c = (code, s) => (COLOR ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const dim = (s) => c('2', s);
+const bold = (s) => c('1', s);
+const cyan = (s) => c('36', s);
+const green = (s) => c('32', s);
+const yellow = (s) => c('33', s);
+const red = (s) => c('31', s);
+const amber = (s) => c('38;5;180', s);
+
+const [classArg, ...rest] = process.argv.slice(2);
+const flags = new Set(rest.filter((a) => a.startsWith('--')));
+const slugArg = rest.find((a) => !a.startsWith('--'));
+
+if (!classArg) {
+  console.error('usage: studyos sheet live <class> [--sheet slug]');
+  process.exit(1);
+}
+
+// --- load the worksheet ----------------------------------------------------
+
+const manifests = sheet.listManifests(classArg, ROOT);
+const manifest = slugArg ? manifests.find((m) => m.slug === slugArg) : manifests[0];
+
+if (!manifest) {
+  console.error(
+    `studyos: no worksheet found for ${classArg}.\n` + `  Create one:  studyos sheet new ${classArg}`,
+  );
+  process.exit(1);
+}
+
+const pdf = sheet.resolveSheetFile(manifest);
+if (!pdf) {
+  console.error(
+    `studyos: ${manifest.sheet} isn't in the synced folder yet.\n` +
+      `  ${sheet.sheetDir()}\n` +
+      `  If you just generated it, give iCloud a moment.`,
+  );
+  process.exit(1);
+}
+
+// --- headless Claude Code --------------------------------------------------
+
+const claude = spawn(
+  'claude',
+  [
+    '--print',
+    '--model', MODEL,
+    '--input-format', 'stream-json',
+    '--output-format', 'stream-json',
+    '--permission-mode', 'acceptEdits',
+    '--verbose',
+  ],
+  { cwd: ROOT, stdio: ['pipe', 'pipe', 'pipe'] },
+);
+
+claude.on('error', (e) => {
+  console.error(
+    e.code === 'ENOENT'
+      ? 'studyos: `claude` not found on PATH.'
+      : `studyos: ${e.message}`,
+  );
+  process.exit(127);
+});
+
+const send = (text) =>
+  claude.stdin.write(
+    JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }) +
+      '\n',
+  );
+
+/** Resolves with the assistant's text for the next completed turn. */
+let pendingTurn = null;
+let stdoutBuf = '';
+
+claude.stdout.on('data', (d) => {
+  stdoutBuf += d.toString();
+  const lines = stdoutBuf.split('\n');
+  stdoutBuf = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (ev.type === 'assistant') {
+      const text = (ev.message?.content ?? [])
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('')
+        .trim();
+      if (text && pendingTurn) {
+        const resolve = pendingTurn;
+        pendingTurn = null;
+        resolve(text);
+      }
+    }
+  }
+});
+
+function ask(prompt) {
+  return new Promise((resolve) => {
+    pendingTurn = resolve;
+    send(prompt);
+  });
+}
+
+// --- terminal input --------------------------------------------------------
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const readLine = (q) => new Promise((resolve) => rl.question(q, (a) => resolve(a.trim())));
+
+let spinner = null;
+function startSpinner(label) {
+  if (!process.stdout.isTTY) return;
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  spinner = setInterval(() => {
+    process.stdout.write(`\r  ${amber(frames[i++ % frames.length])} ${dim(label)}   `);
+  }, 90);
+}
+function stopSpinner() {
+  if (spinner) {
+    clearInterval(spinner);
+    spinner = null;
+    if (process.stdout.isTTY) process.stdout.write('\r' + ' '.repeat(60) + '\r');
+  }
+}
+
+function cleanup() {
+  stopSpinner();
+  try {
+    claude.stdin.end();
+  } catch {
+    /* already closed */
+  }
+  rl.close();
+}
+
+// --- the loop --------------------------------------------------------------
+
+console.log(`
+  ${amber('┌─┐┌┬┐┬ ┬┌┬┐┬ ┬  ┌─┐┌─┐')}   ${dim('handwriting')}
+  ${amber('└─┐ │ │ ││ │└┬┘  │ │└─┐')}
+  ${amber('└─┘ ┴ └─┘─┴┘ ┴   └─┘└─┘')}
+`);
+console.log(`  ${bold(cyan(manifest.class))} ${dim('·')} ${manifest.slug}`);
+console.log(`  ${dim(`${manifest.questions.length} questions · ${path.basename(pdf)}`)}`);
+console.log(`  ${dim('Open it in Files on the iPad and answer with the Pencil.')}\n`);
+
+const results = [];
+
+for (const q of manifest.questions) {
+  const n = q.page;
+  console.log(
+    `  ${bold(`Q${n}`)} ${dim('·')} ${cyan(q.topic)}` +
+      `${dim(`   [${n}/${manifest.questions.length}]`)}`,
+  );
+  for (const line of q.question.split('\n')) console.log(`     ${line}`);
+  console.log('');
+
+  const answer = await readLine(
+    `  ${amber('✎')} write on the iPad, then press Enter   ${dim('(s skip · q quit)')} `,
+  );
+  if (answer.toLowerCase() === 'q') {
+    console.log(dim('\n  stopped.\n'));
+    break;
+  }
+  if (answer.toLowerCase() === 's') {
+    console.log(dim('  skipped.\n'));
+    results.push({ page: n, topic: q.topic, status: 'skipped' });
+    continue;
+  }
+
+  // Wait for the iPad's edit to land and stop changing. Grading a file that is
+  // still syncing reads as a blank page, which would be reported as an error.
+  const baseline = sheet.fingerprint();
+  startSpinner('waiting for the iPad to sync…');
+  const synced = await sheet.waitForEdit(baseline, { timeoutMs: 20_000, settleMs: 2000 });
+  stopSpinner();
+
+  if (!synced.ok) {
+    // Not fatal: the file may already have synced before Enter was pressed.
+    console.log(dim(`  (no new sync detected — grading the copy on disk)`));
+  }
+
+  const live = sheet.resolveSheetFile(manifest) ?? pdf;
+  const ink = inkFraction(live, n);
+  if (ink !== null && ink <= BLANK_INK_CEILING) {
+    console.log(`  ${dim('nothing written on this page — not attempted')}\n`);
+    results.push({ page: n, topic: q.topic, status: 'blank' });
+    continue;
+  }
+
+  const img = pageToPng(live, n, { dpi: 150 });
+  if (!img.ok) {
+    console.log(`  ${red('could not render the page')} ${dim(img.error)}\n`);
+    results.push({ page: n, topic: q.topic, status: 'error' });
+    continue;
+  }
+
+  startSpinner('grading your work…');
+  const verdict = await ask(
+    [
+      `Grade one handwritten answer. Read the image at: ${img.file}`,
+      '',
+      `Topic: ${q.topic}`,
+      `Question: ${q.question}`,
+      `A correct answer contains: ${q.expected || '(not specified — judge on the mathematics)'}`,
+      '',
+      'Reply in at most 6 lines, plain text, no markdown headers:',
+      'Line 1 exactly one of: CORRECT | PARTIAL | INCORRECT | UNREADABLE',
+      'Line 2 exactly one of: confidence=high | confidence=medium | confidence=low',
+      '  (confidence is about how well you could READ it, not whether it is right)',
+      'Line 3: one line paraphrasing what you read.',
+      'Then: the specific misconception if wrong, and the correct reasoning briefly.',
+      '',
+      'If the handwriting is genuinely illegible say UNREADABLE rather than guessing —',
+      'a confidently wrong grade corrupts the permanent study log.',
+      'Do not log any event; the harness handles that.',
+    ].join('\n'),
+  );
+  stopSpinner();
+
+  const lines = verdict.split('\n');
+  const tag = (lines[0] ?? '').toUpperCase();
+  const conf = /confidence=(high|medium|low)/i.exec(verdict)?.[1]?.toLowerCase() ?? 'low';
+
+  const label =
+    tag.includes('CORRECT') && !tag.includes('INCORRECT')
+      ? green('✓ correct')
+      : tag.includes('PARTIAL')
+        ? yellow('~ partially correct')
+        : tag.includes('UNREADABLE')
+          ? dim('? unreadable')
+          : red('✗ incorrect');
+
+  console.log(`  ${label}  ${dim(`confidence ${conf}`)}`);
+  for (const line of lines.slice(2)) if (line.trim()) console.log(`     ${line}`);
+
+  // Low or medium confidence never auto-logs: reading handwritten mathematics
+  // is error-prone, and a wrong grade written into an append-only log corrupts
+  // both mastery and the calibration baseline.
+  let confirmed = conf === 'high' && !tag.includes('UNREADABLE');
+  if (!confirmed && !tag.includes('UNREADABLE')) {
+    const ok = await readLine(
+      `  ${yellow('?')} couldn't read that confidently — is the grade right? ${dim('(y/n/skip)')} `,
+    );
+    if (ok.toLowerCase().startsWith('y')) confirmed = true;
+    else if (ok.toLowerCase().startsWith('n')) {
+      console.log(dim('  not logged.'));
+      results.push({ page: n, topic: q.topic, status: 'disputed' });
+      console.log('');
+      continue;
+    } else {
+      results.push({ page: n, topic: q.topic, status: 'skipped' });
+      console.log('');
+      continue;
+    }
+  }
+
+  if (tag.includes('UNREADABLE')) {
+    console.log(dim('  not logged — try a photo, or rewrite it larger.'));
+    results.push({ page: n, topic: q.topic, status: 'unreadable' });
+  } else {
+    results.push({
+      page: n,
+      topic: q.topic,
+      status: 'graded',
+      correct: tag.includes('PARTIAL') ? 0.5 : tag.includes('INCORRECT') ? 0 : 1,
+      confidence: conf,
+    });
+  }
+  console.log('');
+}
+
+cleanup();
+
+// --- log and summarise -----------------------------------------------------
+
+const graded = results.filter((r) => r.status === 'graded');
+if (graded.length === 0) {
+  console.log(dim('  Nothing graded, so nothing logged.\n'));
+  process.exit(0);
+}
+
+// One event per topic. Skipped, blank, unreadable, and disputed pages are
+// excluded from `asked` — they are not evidence either way, and counting them
+// as wrong would fabricate a weakness.
+const byTopic = new Map();
+for (const r of graded) {
+  if (!byTopic.has(r.topic)) byTopic.set(r.topic, { asked: 0, correct: 0 });
+  const t = byTopic.get(r.topic);
+  t.asked += 1;
+  t.correct += r.correct;
+}
+
+const events = [...byTopic.entries()].map(([topic, t]) => ({
+  type: 'quiz',
+  class: manifest.class,
+  topic,
+  asked: t.asked,
+  correct: t.correct,
+  source: `worksheets/${manifest.slug}`,
+}));
+
+const { append } = await import('../lib/events.js');
+for (const e of events) append(e, ROOT);
+
+const asked = events.reduce((s, e) => s + e.asked, 0);
+const correct = events.reduce((s, e) => s + e.correct, 0);
+
+console.log(`  ${bold('Done.')} ${correct}/${asked} on ${events.length} topic(s)`);
+for (const r of results.filter((x) => x.status !== 'graded')) {
+  console.log(dim(`    Q${r.page} ${r.topic} — ${r.status}, not logged`));
+}
+console.log(dim(`\n  studyos rebuild ${manifest.class}   to refresh mastery\n`));

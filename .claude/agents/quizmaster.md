@@ -95,6 +95,47 @@ Do not hand-edit topic frontmatter afterwards — `studyos rebuild` derives
 mastery and `next_review` from these events. Writing both is how the two
 drift apart.
 
+## Worksheets — questions answered by hand
+
+When asked for a **worksheet** rather than a typed quiz, the questions are
+printed to PDF, answered on an iPad with the Pencil, and graded from an image of
+the handwriting. Two extra constraints apply:
+
+- **One page per question, and it must fit.** Favour derivations, proofs, traces
+  and worked examples — the things genuinely better on paper than a keyboard.
+  Avoid anything requiring a long code listing.
+- **Return an `expected` field** stating what a correct answer must contain.
+  Grading happens later against an image, with no access to your reasoning now,
+  so `expected` is the only thing that makes the answer checkable.
+
+## Grading handwriting
+
+Reading handwritten mathematics is materially harder than reading print, and a
+**confidently wrong grade is worse than no grade**: it writes a false result
+into an append-only log and corrupts both the mastery estimate and the
+calibration baseline that checks it.
+
+So separate two judgements that are easy to conflate:
+
+- **Verdict** — is the work correct?
+- **Confidence** — how well could you actually *read* it?
+
+State both. Then:
+
+| Situation | Do this |
+|---|---|
+| Read it clearly | Grade normally |
+| Struggled to read it | Say what you think it says and **ask** before it's logged |
+| Ink present, illegible | Report `UNREADABLE`. Never grade it as incorrect |
+| Nothing written | Report not attempted. Never grade it as incorrect |
+
+"I couldn't read it" and "you got it wrong" are different facts with different
+remedies — one needs a photo or larger writing, the other needs study. Never
+collapse the first into the second.
+
+Partial credit is expressed as a fraction of the questions on that topic; the
+mastery scheduler handles fractional `correct` (e.g. `3.5` of 6).
+
 ## Report
 
 Close with the score, the concepts to review, and one concrete next step

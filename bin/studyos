@@ -83,6 +83,7 @@ const COMMANDS = {
   plan: { mode: 'interactive', slash: 'plan', help: '[today|week]      Build a study plan' },
   log: { mode: 'print', slash: 'log', help: '"<what you did>"  Record a study session' },
   review: { mode: 'print', slash: 'review', help: '[--class X]       Analyst pass over your history' },
+  sheet: { mode: 'local', help: '<new|live|grade|where>  Handwriting worksheets for the iPad' },
   grade: { mode: 'interactive', slash: 'grade', help: '<class> [--exam N] Record a real exam result' },
   status: { mode: 'local', help: '[class]           Dashboard: mastery, due, upcoming' },
   calibrate: { mode: 'local', help: '[class]           Did mastery predict your exam scores?' },
@@ -140,6 +141,9 @@ switch (name) {
     break;
   case 'calibrate':
     exitWith(await cmdCalibrate(rest));
+    break;
+  case 'sheet':
+    exitWith(await cmdSheet(rest));
     break;
   case 'pull':
     exitWith(await cmdPull(rest));
@@ -417,6 +421,81 @@ async function cmdStatus(args) {
   }
   console.log('');
   return 0;
+}
+
+async function cmdSheet(args) {
+  const sub = args[0] ?? 'where';
+  const rest = args.slice(1);
+  const sheet = await import('../lib/sheet.js');
+
+  if (sub === 'where') {
+    const dir = sheet.sheetDir();
+    const exists = fs.existsSync(dir);
+    console.log(`\n  worksheet folder: ${dir}`);
+    console.log(`  ${exists ? 'exists' : 'not created yet — run: studyos sheet new <class>'}`);
+    if (exists) {
+      const fp = sheet.fingerprint(dir);
+      console.log(`  ${fp.entries.length} sheet(s)` + (fp.pending ? `, ${fp.pending} still syncing` : ''));
+      for (const e of fp.entries.slice(-5)) console.log(`    ${e.name}`);
+    }
+    if (!process.env.STUDYOS_SHEET_DIR) {
+      console.log(
+        `\n  \x1b[2mOn the iPad: Files › iCloud Drive › StudyOS › worksheets\x1b[0m\n` +
+          `  \x1b[2mOverride the location with STUDYOS_SHEET_DIR (e.g. a Dropbox folder\n` +
+          `  if you'd rather work in GoodNotes).\x1b[0m`,
+      );
+    }
+    console.log('');
+    return 0;
+  }
+
+  if (sub === 'new') {
+    const id = mustResolve(rest[0]);
+    if (!id) return 1;
+    sheet.ensureSheetDir();
+    // Question authoring needs the quizmaster, so this forwards to the slash
+    // command rather than being done here.
+    return await forward({ slash: 'sheet', mode: 'print' }, [id, ...rest.slice(1)]);
+  }
+
+  if (sub === 'grade') {
+    const id = mustResolve(rest[0]);
+    if (!id) return 1;
+    return await forward({ slash: 'grade-sheet', mode: 'print' }, [id, ...rest.slice(1)]);
+  }
+
+  if (sub === 'live') {
+    const id = mustResolve(rest[0]);
+    if (!id) return 1;
+    const res = spawnSync(process.execPath, [path.join(ROOT, 'bin', 'studyos-sheet'), id, ...rest.slice(1)], {
+      cwd: ROOT,
+      stdio: 'inherit',
+    });
+    return res.status ?? 0;
+  }
+
+  if (sub === 'list') {
+    const id = mustResolve(rest[0]);
+    if (!id) return 1;
+    const all = sheet.listManifests(id, ROOT);
+    if (all.length === 0) {
+      console.log(`No worksheets for ${id} yet.  studyos sheet new ${id}`);
+      return 0;
+    }
+    for (const m of all) {
+      const file = sheet.resolveSheetFile(m);
+      console.log(
+        `  ${m.slug}  ${String(m.questions.length).padStart(2)}q  ${m.topics.join(', ')}` +
+          (file ? '' : '  \x1b[2m(pdf not in synced folder)\x1b[0m'),
+      );
+    }
+    return 0;
+  }
+
+  console.error(
+    `studyos sheet: unknown subcommand "${sub}" (expected new, live, grade, list, where)`,
+  );
+  return 1;
 }
 
 /**

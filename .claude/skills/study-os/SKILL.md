@@ -160,6 +160,43 @@ path field, and it matches the `source:` field in note frontmatter. Mixed
 conventions in an append-only log can't be cleaned up later, so get this right
 on the way in.
 
+## Worksheets
+
+A worksheet is a generated PDF answered by hand on an iPad and graded from an
+image of the handwriting. Two artefacts, deliberately in different places:
+
+```
+<synced folder>/<slug>.pdf                      the PDF the iPad sees
+vault/classes/<id>/worksheets/<slug>.json       the manifest (stays local)
+```
+
+The synced folder is iCloud Drive › StudyOS › worksheets by default, or whatever
+`STUDYOS_SHEET_DIR` points at. Only the PDF leaves the machine; the manifest —
+which contains the expected answers — never syncs.
+
+**Two invariants, both load-bearing:**
+
+- **One question per page, and no cover page**, so page N is always question N.
+  Grading addresses pages by number; an extra leading page silently mis-grades
+  everything after it.
+- **The manifest is the source of truth for intent.** It records each page's
+  topic, question, and what a correct answer contains, so grading never has to
+  re-derive the question from a photograph of it.
+
+Always go through `lib/sheet.js` (`buildManifest`, `writeManifest`,
+`writeSheetPdf`) rather than assembling paths or PDFs by hand — the invariants
+above are enforced there.
+
+To read a page, rasterise it with `lib/pdfpage.js` and look at the image.
+Handwriting lives in PDF *annotations*, and rendering to pixels is what
+guarantees it's visible. `inkFraction()` distinguishes an unanswered page
+(≈0.002–0.008, just the printed question) from an attempted one, so a blank page
+is reported as not attempted rather than graded wrong.
+
+Grading a worksheet logs ordinary `quiz` events per topic. Skipped, blank, and
+unreadable pages are **excluded from `asked`** — they are not evidence either
+way, and counting them as wrong would fabricate a weakness.
+
 ## Style for note files
 
 Transcribed notes are faithful records, not summaries. Preserve the original
